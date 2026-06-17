@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# PRIMARY / RECOMMENDED: CronJob
+#
+# Runs the full connectivity test on a schedule from wherever the scheduler
+# places the pod. This is the right default for validating "can the cluster
+# reach Redis" -- i.e. the network path, DNS, TLS, auth, and Redis server
+# health -- without putting continuous read/write load on the cache from
+# every node simultaneously.
+#
+# Failed Jobs show up in `kubectl get jobs` / `kubectl get cronjobs` and are
+# straightforward to wire into alerting (e.g. via kube-state-metrics
+# kube_job_status_failed, or Prometheus alerting on Job failures).
+# ---------------------------------------------------------------------------
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redis-connectivity-test
+  namespace: default
+  labels:
+    app: redis-connectivity-test
+spec:
+  schedule: "*/5 * * * *"        # every 5 minutes; adjust to taste
+  concurrencyPolicy: Forbid       # don't pile up overlapping runs if one hangs
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 10      # keep more failure history for troubleshooting
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 1              # don't retry-storm against a possibly-degraded cache
+      activeDeadlineSeconds: 90    # hard ceiling so a hung run gets killed, not left dangling
+      template:
+        metadata:
+          labels:
+            app: redis-connectivity-test
+        spec:
+          restartPolicy: Never
+          # If your AKS cluster uses Private Endpoints / Private DNS Zones for
+          # the cache, no special networking config is needed here beyond
+          # normal pod DNS -- but if you run Azure CNI with custom DNS or a
+          # firewall-routed egress (e.g. via Azure Firewall / NVA), make sure
+          # this pod's node pool/subnet has the same route table as your
+          # application pods, or you'll get a false negative that doesn't
+          # reflect real app connectivity.
+          containers:
+            - name: redis-connectivity-test
+              image: <YOUR_REGISTRY>/redis-connectivity-test:latest   # CHANGE ME
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: MODE
+                  value: "once"
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+              envFrom:
+                - configMapRef:
+                    name: redis-conn-test-config
+                - secretRef:
+                    name: redis-conn-test-secret
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir: {}
