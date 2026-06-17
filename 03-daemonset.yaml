@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# ALTERNATIVE: DaemonSet (per-node validation)
+#
+# Use this instead of/alongside the CronJob when you specifically need to
+# answer "does every node have a working path to Redis" -- e.g. after
+# suspecting a node-specific NSG association, a bad CNI/route table on one
+# node, or troubleshooting an issue that only reproduces on certain nodes.
+#
+# This runs MODE=loop with CHECK_INTERVAL, continuously, one pod per node.
+# Because every node runs SET/GET/HSET/INCR against the cache every interval,
+# keep CHECK_INTERVAL reasonably long (60s+) for anything but short-lived
+# troubleshooting -- on a large node pool this multiplies write load on the
+# cache. Consider setting SKIP_WRITE_TEST=true here and leaving read/write
+# validation to the CronJob, if you only care about reachability per node.
+#
+# Logs from a specific node:
+#   kubectl logs -n default -l app=redis-connectivity-test-daemon --field-selector spec.nodeName=<node>
+# ---------------------------------------------------------------------------
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: redis-connectivity-test-daemon
+  namespace: default
+  labels:
+    app: redis-connectivity-test-daemon
+spec:
+  selector:
+    matchLabels:
+      app: redis-connectivity-test-daemon
+  template:
+    metadata:
+      labels:
+        app: redis-connectivity-test-daemon
+    spec:
+      containers:
+        - name: redis-connectivity-test
+          image: <YOUR_REGISTRY>/redis-connectivity-test:latest   # CHANGE ME
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MODE
+              value: "loop"
+            - name: SKIP_WRITE_TEST
+              value: "true"     # recommended for DaemonSet use -- see header note above
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          envFrom:
+            - configMapRef:
+                name: redis-conn-test-config
+            - secretRef:
+                name: redis-conn-test-secret
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "exit 0"]   # loop mode itself is the health signal via logs; see note below
+            initialDelaySeconds: 30
+            periodSeconds: 60
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      tolerations:
+        # Run on all nodes including any tainted system/infra node pools, so
+        # the test reflects the actual network path for pods scheduled there
+        - operator: "Exists"
+          effect: "NoSchedule"
+
+# Note on the livenessProbe above: it intentionally always passes. The
+# DaemonSet's job is to record pass/fail results to logs/stdout per loop
+# iteration, not to represent its own liveness as "Redis is reachable" --
+# doing the latter would cause Kubernetes to kill and restart the pod on
+# every transient Redis blip, which destroys your failure history right when
+# you need it. Alert on the JSON output via your log pipeline instead.
